@@ -1,0 +1,16 @@
+{
+  "cuts": [
+    {
+      "from": "00:01:00.000",
+      "to": "00:02:00.000"
+    }, {
+      "from": "00:03:00.000",
+      "to": "00:04:00.000"
+    }
+  ],
+  "codec": "libx265",
+  "preset": "slow",
+  "crf": "32",
+  "bitRateA": "128k",
+  "soundVolumeOptimize": true
+}
