@@ -13,7 +13,10 @@
 
 import HttpService.*
 import cats.effect.unsafe.implicits.*
+import cats.syntax.all.*
+import io.circe.*
 import io.circe.generic.auto.*
+import io.circe.syntax.*
 import models.AudioQuery.{AccentPhrase, Mora}
 import models.{AudioQuery, Speaker}
 import os.Path
@@ -31,6 +34,7 @@ object App {
       case "speakers" | "s" => showSpeakers(getSpeakers())
       case "exportAudioQuery" | "aq" => exportAudioQuery()
       case "exportAudio" | "a" => exportAudio()
+      case "exportAudioQueryAndAudio" | "aqa" => exportAudio(exportAudioQuery().some)
       case _ => println("No Action Selected.")
     }
   }
@@ -48,7 +52,7 @@ object App {
     HttpService.getJson[List[Speaker]](s"$basePath/speakers".toUriUnsafe).unsafeRunSync()
   }
 
-  def exportAudioQuery(): Unit = {
+  def exportAudioQuery(): Path = {
     val input: Path = os.pwd / "input" / "text.tsv"
     val outputDir: Path = os.pwd / "output"
     val output: Path = outputDir / "aq.tsv"
@@ -62,10 +66,13 @@ object App {
       ).map(_.mkString("\t")).mkString("\n")
       os.write.over(output, tsv)
     } else println(s"${input}を配置してください。")
+
+    output
   }
 
   val queryHeader = "=AudioQuery="
   val morasHeader = "=Moras="
+  val pauseMorasHeader = "=PauseMoras="
 
   def convertAudioQueryToList(aq: AudioQuery,
                               speakerId: SpeakerId): List[List[String]] = {
@@ -89,6 +96,7 @@ object App {
 
     val phraseHeader: List[String] = List(queryHeader, "スピーカーID", "速度", "音程", "抑揚", "音量") // "空秒前", "空秒後", "停止長", "停止長率", "サンプリングレート", "ステレオ"),
     val phraseRow: List[String] = List("", speakerId, nD(aq.speedScale), nD(aq.pitchScale), nD(aq.intonationScale), nD(aq.volumeScale))
+    val pauseMoraHeader: List[String] = List(pauseMorasHeader, "文字", "母音", "母音長")
     val moraHeader: List[String] = List(morasHeader, "文字", "アクセント", "子音", "子音長", "母音", "母音長", "音程")
 
     def mkMoraRow(m: Mora,
@@ -96,11 +104,18 @@ object App {
       List("", m.text, if (isAccent) "!" else "", nOS(m.consonant), nOD(m.consonant_length), m.vowel, nD(m.vowel_length), nD(m.pitch))
     }
 
+    def mkPauseMoraRow(p: AccentPhrase): List[String] = {
+      p.pause_mora.fold(Nil) { m =>
+        List("", m.text, m.vowel, nD(m.vowel_length))
+      }
+    }
+
     val rows: List[List[String]] =
       phraseHeader ::
         phraseRow ::
         aq.accent_phrases.flatMap { p =>
-          moraHeader :: p.moras.zipWithIndex.map((m, i) => mkMoraRow(m, i == p.accent))
+          moraHeader :: p.moras.zipWithIndex.map((m, i) => mkMoraRow(m, i == p.accent - 1)) :::
+            List(pauseMoraHeader, mkPauseMoraRow(p))
         }
 
     rows.map { r =>
@@ -124,9 +139,22 @@ object App {
       )
     }
 
+    def parsePauseMora(row: List[String]): Option[Mora] = {
+      if(row.lift(1).exists(_.nonEmpty)) {
+        Mora(
+          text = row(1),
+          consonant = None,
+          consonant_length = None,
+          vowel = row(2),
+          vowel_length = row(3).toDouble,
+          pitch = 0.0
+        ).some
+      } else None
+    }
+    
     val lastRowIdx = data.length - 1
     val dataWithIdx = data.zipWithIndex
-    val aqHeaderWithIdxes = dataWithIdx.filter(r => r._1(0) == queryHeader)
+    val aqHeaderWithIdxes = dataWithIdx.filter(r => r._1.headOption.contains(queryHeader))
 
     aqHeaderWithIdxes.zipWithIndex.map { case ((_, startAqIdx), i) =>
       val aqRow = data(startAqIdx + 1)
@@ -136,21 +164,25 @@ object App {
       }
 
       val morasRangedRows = dataWithIdx.slice(startAqIdx + 2, startAqIdx + 2 + endAqIdx - (startAqIdx + 1))
-      val morasHeaderIdxes = morasRangedRows.filter(row => row._1(0) == morasHeader)
-      val morasGroups: List[List[(Mora, IsAccent)]] = morasHeaderIdxes.zipWithIndex.map { case ((_, startIdx), j) =>
+      val morasHeaderIdxes = morasRangedRows.filter(row => row._1.headOption.contains(morasHeader))
+      val morasGroups: List[(List[(Mora, IsAccent)], Option[Mora])] = morasHeaderIdxes.zipWithIndex.map { case ((_, startIdx), j) =>
         val endIdx = morasHeaderIdxes.lift(j + 1) match {
-          case Some(next) => next._2 - 1
-          case None => endAqIdx
+          case Some(next) => next._2 - 3
+          case None => endAqIdx - 2 
         }
+        
         (startIdx + 1 to endIdx).map { idx =>
-          parseMora(data(idx)) -> data(2).nonEmpty
-        }.toList
+          val mora = parseMora(data(idx))
+          val isAccent = data(idx)(2).nonEmpty
+          (mora, isAccent)
+        }.toList -> parsePauseMora(data(endIdx + 2))
       }
-
-      val phrases = morasGroups.map { ms =>
+      
+      val phrases = morasGroups.map { (ms, pm) =>
         AccentPhrase(
           moras = ms.map(_._1),
-          accent = Math.max(ms.indexWhere(_._2), 0)
+          accent = Math.max(ms.indexWhere(_._2), 0),
+          pause_mora = pm,
         )
       }
 
@@ -173,22 +205,22 @@ object App {
     HttpService.postJson[String, AudioQuery](uri, "").unsafeRunSync()
   }
 
-  def exportAudio(): Unit = {
-    val input: Path = os.pwd / "input" / "aq.tsv"
+  def exportAudio(input: Option[Path] = None): Unit = {
+    val fixedInput: Path = input.getOrElse(os.pwd / "input" / "aq.tsv")
     val outputDir: Path = os.pwd / "output"
     os.makeDir.all(outputDir)
 
-    if (os.exists(input)) {
-      val lines = os.read.lines(input).map(_.split("\t").toList).toList
+    if (os.exists(fixedInput)) {
+      val lines = os.read.lines(fixedInput).map(_.split("\t").toList).toList
       val aqs = covertListToAudioQuery(lines)
       aqs.zipWithIndex.foreach { case ((aq, speakerId), i) =>
         val uri = s"$basePath/synthesis".toUriUnsafe
           .withQueryParams(Map("speaker" -> speakerId))
         val wav = HttpService.postJsonGetBytes(uri, aq).unsafeRunSync()
-        // os.write.over(outputDir / s"$i.json", aq.asJson.noSpaces)
+        os.write.over(outputDir / s"$i.json", aq.asJson.noSpaces)
         os.write.over(outputDir / s"$i.wav", wav)
       }
-    } else println(s"${input}を配置してください。")
+    } else println(s"${fixedInput}を配置してください。")
   }
 
 
